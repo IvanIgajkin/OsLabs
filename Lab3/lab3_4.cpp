@@ -1,231 +1,149 @@
-#include <cstdio>
-#include <cstdlib>
-#include <ctime>
-#include <Windows.h>
+#include <windows.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-#define DATA_FILE "data.dat"
-#define LEN_MAX 20
-#define MAX_RAND 255
+#define BUFFER_SIZE 10
+#define PRODUCER_SLEEP_TIME_MS 500
+#define CONSUMER_SLEEP_TIME_MS 2000
 
-#define READERS_COUNT 4
-#define THREADS_COUNT READERS_COUNT + 1
-#define WRITER_IDX 0
-#define FIRST_READER_IDX 1
-#define WAIT_LIMIT 100
+LONG Buffer[BUFFER_SIZE];
+LONG LastItemProduced;
+ULONG QueueSize;
+ULONG QueueStartOffset;
 
-bool FileExists(const char* fileName);
-inline void CreateDataFile(const char* fileName);
-char* GenerateData();
-inline void InitDataFile(const char* fileName);
+ULONG TotalItemsProduced;
+ULONG TotalItemsConsumed;
 
-HANDLE ghWriteEvent;
+CONDITION_VARIABLE BufferNotEmpty;
+CONDITION_VARIABLE BufferNotFull;
+CRITICAL_SECTION   BufferLock;
 
-int activeReadersCount = 0;
-bool inWriteMode = false;
-UINT32 writerOnWaiting = 0;
-bool isWriterHungry = false;
+BOOL StopRequested;
 
-DWORD WINAPI WriteData(LPVOID lpParam);
-DWORD WINAPI ReadData(LPVOID lpParam);
+DWORD WINAPI ProducerThreadProc(PVOID p)
+{
+    ULONG ProducerId = (ULONG)(ULONG_PTR)p;
 
-int main() {
+    while (true)
+    {
+        // Produce a new item.
 
-	//проверяем наличие файла с данными
-	if (!FileExists(DATA_FILE)) {
-		//создаём файл в случае его отсутствия
-		CreateDataFile(DATA_FILE);
-	}
+        Sleep(rand() % PRODUCER_SLEEP_TIME_MS);
 
-	//инициализируем данные и заполняем файл
-	InitDataFile(DATA_FILE);
+        ULONG Item = InterlockedIncrement(&LastItemProduced);
 
-	//объявляем массивы потоков
-	HANDLE hThreadArray[THREADS_COUNT];
-	DWORD dwThreadIdArray[THREADS_COUNT];
+        EnterCriticalSection(&BufferLock);
 
-	//выделяем память под рабочие данные потоков
-	char** dataArray = (char**)calloc(THREADS_COUNT, sizeof(char*));
-	if (dataArray == NULL) {
-		return 1;
-	}
+        while (QueueSize == BUFFER_SIZE && StopRequested == FALSE)
+        {
+            // Buffer is full - sleep so consumers can get items.
+            SleepConditionVariableCS(&BufferNotFull, &BufferLock, INFINITE);
+        }
 
-	for (int idx = 0; idx < THREADS_COUNT; idx++) {
-		dataArray[idx] = (char*)calloc(LEN_MAX, sizeof(char));
-	}
+        if (StopRequested == TRUE)
+        {
+            LeaveCriticalSection(&BufferLock);
+            break;
+        }
 
-	//запускаем процесс непрерывной работы с файлом данных
-	int processExitCode = 0;
-	while (true) {
-		if (isWriterHungry && activeReadersCount > 0) {
-			//останавливаем все операции чтения, чтобы сделать запись
-			for (int idx = FIRST_READER_IDX; idx < THREADS_COUNT; idx++) {
-				 TerminateThread(hThreadArray[idx], 0);
-			}
-		}
+        // Insert the item at the end of the queue and increment size.
 
-		//данные для записи
-		dataArray[WRITER_IDX] = GenerateData();
+        Buffer[(QueueStartOffset + QueueSize) % BUFFER_SIZE] = Item;
+        QueueSize++;
+        TotalItemsProduced++;
 
-		//инициализируем писателя
-		hThreadArray[WRITER_IDX] = CreateThread(
-			NULL,
-			0,
-			WriteData,
-			dataArray[WRITER_IDX],
-			0,
-			&dwThreadIdArray[WRITER_IDX]);
+        printf("Producer %u: item %2d, queue size %2u\r\n", ProducerId, Item, QueueSize);
 
-		if (hThreadArray[WRITER_IDX] == NULL) {
-			printf("Can't start \"Writer\": %d\n", GetLastError());
-			processExitCode = 1;
-			break;
-		}
+        LeaveCriticalSection(&BufferLock);
 
-		//инициализируем читателей
-		for (int idx = FIRST_READER_IDX; idx < THREADS_COUNT; idx++) {
-			hThreadArray[idx] = CreateThread(
-				NULL,
-				0,
-				ReadData,
-				&dwThreadIdArray[idx],
-				0,
-				&dwThreadIdArray[idx]);
+        // If a consumer is waiting, wake it.
 
-			if (hThreadArray[idx] == NULL) {
-				printf("Can't start \"Readers\": %d\n", GetLastError());
-				processExitCode = 1;
-				break;
-			}
-		}
-	}
+        WakeConditionVariable(&BufferNotEmpty);
+    }
 
-	return processExitCode;
+    printf("Producer %u exiting\r\n", ProducerId);
+    return 0;
 }
 
-#pragma region FileUtils
-bool FileExists(const char* fileName) {
-	FILE* dataFile = fopen(fileName, "r");
-	const bool condition = dataFile != NULL;
+DWORD WINAPI ConsumerThreadProc(PVOID p)
+{
+    ULONG ConsumerId = (ULONG)(ULONG_PTR)p;
 
-	if (condition) {
-		fclose(dataFile);
-	}
+    while (true)
+    {
+        EnterCriticalSection(&BufferLock);
 
-	return condition;
+        while (QueueSize == 0 && StopRequested == FALSE)
+        {
+            // Buffer is empty - sleep so producers can create items.
+            SleepConditionVariableCS(&BufferNotEmpty, &BufferLock, INFINITE);
+        }
+
+        if (StopRequested == TRUE && QueueSize == 0)
+        {
+            LeaveCriticalSection(&BufferLock);
+            break;
+        }
+
+        // Consume the first available item.
+
+        LONG Item = Buffer[QueueStartOffset];
+
+        QueueSize--;
+        QueueStartOffset++;
+        TotalItemsConsumed++;
+
+        if (QueueStartOffset == BUFFER_SIZE)
+        {
+            QueueStartOffset = 0;
+        }
+
+        printf("Consumer %u: item %2d, queue size %2u\r\n",
+            ConsumerId, Item, QueueSize);
+
+        LeaveCriticalSection(&BufferLock);
+
+        // If a producer is waiting, wake it.
+
+        WakeConditionVariable(&BufferNotFull);
+
+        // Simulate processing of the item.
+
+        Sleep(rand() % CONSUMER_SLEEP_TIME_MS);
+    }
+
+    printf("Consumer %u exiting\r\n", ConsumerId);
+    return 0;
 }
 
-inline void CreateDataFile(const char* fileName) {
-	FILE* dataFile = fopen(fileName, "w");
-	fclose(dataFile);
-}
+int main(void)
+{
+    InitializeConditionVariable(&BufferNotEmpty);
+    InitializeConditionVariable(&BufferNotFull);
 
-char* GenerateData() {
-	srand(time(NULL));
+    InitializeCriticalSection(&BufferLock);
 
-	char* data = (char*)calloc(LEN_MAX, sizeof(char));
-	if (data != NULL) {
-		for (int idx = 0; idx < LEN_MAX; idx++) {
-			data[idx] = (char)(rand() % RAND_MAX);
-		}
-	}
+    DWORD id;
+    HANDLE hProducer1 = CreateThread(NULL, 0, ProducerThreadProc, (PVOID)1, 0, &id);
+    HANDLE hConsumer1 = CreateThread(NULL, 0, ConsumerThreadProc, (PVOID)1, 0, &id);
+    HANDLE hConsumer2 = CreateThread(NULL, 0, ConsumerThreadProc, (PVOID)2, 0, &id);
 
-	return data;
-}
+    puts("Press enter to stop...");
+    getchar();
 
-inline void InitDataFile(const char* fileName) {
-	FILE* dataFile = fopen(fileName, "w");
-	char* data = GenerateData();
-	if (data != NULL) {
-		fprintf(dataFile, data);
-	}
+    EnterCriticalSection(&BufferLock);
+    StopRequested = TRUE;
+    LeaveCriticalSection(&BufferLock);
 
-	fclose(dataFile);
-}
-#pragma endregion
+    WakeAllConditionVariable(&BufferNotFull);
+    WakeAllConditionVariable(&BufferNotEmpty);
 
-DWORD WINAPI WriteData(LPVOID lpParam) {
-	if (activeReadersCount > 0 || inWriteMode) {
-		writerOnWaiting++;
-		if (writerOnWaiting == WAIT_LIMIT) {
-			isWriterHungry = true;
-		}
+    WaitForSingleObject(hProducer1, INFINITE);
+    WaitForSingleObject(hConsumer1, INFINITE);
+    WaitForSingleObject(hConsumer2, INFINITE);
 
-		return 0;
-	}
+    printf("TotalItemsProduced: %u, TotalItemsConsumed: %u\r\n",
+        TotalItemsProduced, TotalItemsConsumed);
 
-	//запускаем событие записи данных
-	ghWriteEvent = CreateEvent(
-		NULL,
-		TRUE,
-		FALSE,
-		TEXT("Write Data"));
-
-	if (ghWriteEvent == NULL) {
-		printf("Can't create event of writing \"%s\": %d\n", DATA_FILE, GetLastError());
-		inWriteMode = false;
-		return 1;
-	}
-
-	inWriteMode = true;
-	writerOnWaiting = 0;
-	isWriterHungry = false;
-
-	//запись данных
-	FILE* dataFile = fopen(DATA_FILE, "a");
-	const char* data = (char*)lpParam;
-	if (dataFile != NULL) {
-		if (data != NULL) {
-			printf("Write: %s\n", data);
-
-			fprintf(dataFile, data);
-		}
-
-		fclose(dataFile);
-	}
-
-	//сигнализируем о завершении события
-	if (!SetEvent(ghWriteEvent)) {
-		printf("SetEvent failed (%d)\n", GetLastError());
-		return 1;
-	}
-
-	inWriteMode = false;
-}
-
-DWORD WINAPI ReadData(LPVOID lpParam) {
-	if (activeReadersCount >= READERS_COUNT || isWriterHungry) {
-		return 0;
-	}
-
-	DWORD dwWaitResult = WaitForSingleObject(
-		ghWriteEvent,
-		INFINITE);
-
-	switch (dwWaitResult) {
-	case WAIT_OBJECT_0: {
-			activeReadersCount++;
-
-			FILE* dataFile = fopen(DATA_FILE, "r");
-			char* data = (char*)lpParam;
-
-			if (dataFile != NULL) {
-				if (data != NULL) {
-					fscanf(dataFile, "%s", data);
-				}
-
-				printf("Read: %s\n", data);
-
-				fclose(dataFile);
-				activeReadersCount--;
-			}
-		}
-
-		break;
-
-	default: {
-			printf("Error while waiting for writing data: (%d)\n", GetLastError());
-		}
-
-		return 1;
-	}
+    return 0;
 }
